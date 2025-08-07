@@ -272,37 +272,21 @@ public:
         thread_local ldns_resolver_ptr resolver(nullptr, &ldns_resolver_deep_free);
         if (!resolver) {
             
-            // --- ИСПРАВЛЕННЫЙ БЛОК КОДА ДЛЯ ИСПОЛЬЗОВАНИЯ 1.1.1.1 ---
-            ldns_resolver* res_ptr = ldns_resolver_new();
-            if (!res_ptr) {
-                log("Ошибка в потоке: не удалось создать ldns_resolver.", "ERROR");
+            // --- ИСПРАВЛЕННЫЙ БЛОК ДЛЯ РЕКУРСИИ С ИСПОЛЬЗОВАНИЕМ ФАЙЛА root.hints ---
+            ldns_resolver* res_ptr = nullptr;
+            FILE *fp = fopen("/etc/ldns/root.hints", "r");
+            if (!fp) {
+                log("Ошибка: не удалось открыть файл /etc/ldns/root.hints", "ERROR");
                 return;
             }
+            
+            ldns_status status = ldns_resolver_new_frm_fp_l(&res_ptr, fp);
+            fclose(fp);
 
-            ldns_rdf* nameserver_rdf = nullptr;
-            ldns_status status_rdf = ldns_str2rdf_a(&nameserver_rdf, "1.1.1.1");
-            if (status_rdf != LDNS_STATUS_OK || !nameserver_rdf) {
-                log("Ошибка: не удалось преобразовать 1.1.1.1 в RDF", "ERROR");
-                ldns_resolver_deep_free(res_ptr);
+            if (status != LDNS_STATUS_OK) {
+                log("Ошибка в потоке: не удалось создать рекурсивный ldns_resolver: " + std::string(ldns_get_errorstr_by_id(status)), "ERROR");
                 return;
             }
-
-            ldns_rr* nameserver_rr = ldns_rr_new();
-            if (!nameserver_rr) {
-                log("Ошибка: не удалось создать RR для nameserver.", "ERROR");
-                ldns_rdf_free(nameserver_rdf);
-                ldns_resolver_deep_free(res_ptr);
-                return;
-            }
-
-            ldns_rr_set_owner(nameserver_rr, ldns_dname_new_frm_str("."));
-            ldns_rr_set_type(nameserver_rr, LDNS_RR_TYPE_A);
-            ldns_rr_set_class(nameserver_rr, LDNS_RR_CLASS_IN);
-            ldns_rr_set_ttl(nameserver_rr, 0);
-            ldns_rr_set_rdf(nameserver_rr, nameserver_rdf, 0);
-
-            ldns_resolver_push_nameserver_rr(res_ptr, nameserver_rr);
-            ldns_rr_free(nameserver_rr);
             
             ldns_resolver_set_recursive(res_ptr, true);
             resolver.reset(res_ptr);
