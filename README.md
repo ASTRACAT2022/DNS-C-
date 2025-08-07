@@ -1,4 +1,8 @@
-
+подготовка 
+```bash
+sudo mkdir -p /etc/ldns/
+sudo wget -O /etc/ldns/root.hints https://www.internic.net/domain/named.root
+```
 -----
 
 ### Шаг 1: Клонирование репозитория
