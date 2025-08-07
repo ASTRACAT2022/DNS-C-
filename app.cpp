@@ -8,6 +8,7 @@
 #include <queue>
 #include <functional>
 #include <condition_variable>
+#include <shared_mutex>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -19,73 +20,161 @@
 #include <csignal>
 #include <memory>
 #include <cstring>
+#include <stdexcept>
+#include <iomanip>
 
+// --- Константы и глобальные переменные ---
 #define MAX_EVENTS 1024
 #define CACHE_SIZE 10000
 #define THREAD_POOL_SIZE 8
-#define PORT 5314
+#define PORT 5313
 #define MAX_PACKET_SIZE 65536
-#define CACHE_TTL 3600
+#define CACHE_TTL 3600 // 1 час
+#define CLEANUP_INTERVAL 10 // 10 секунд для фоновой очистки
 
 static std::atomic<bool> g_stop_signal_received = false;
+static std::mutex log_mutex;
 
-// LRU Cache для DNS-ответов
+// Простая функция для централизованного логирования
+// Теперь логирует только WARN, ERROR и FATAL
+void log(const std::string& message, const std::string& level = "INFO") {
+    if (level == "INFO" || level == "DEBUG") {
+        return; // Игнорируем информационные логи
+    }
+    std::lock_guard<std::mutex> lock(log_mutex);
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    std::cerr << "[" << level << "] " << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %H:%M:%S") << ": " << message << std::endl;
+}
+
+// --- RAII-обертка для файловых дескрипторов ---
+class FileDescriptor {
+public:
+    explicit FileDescriptor(int fd = -1) : fd_(fd) {}
+    ~FileDescriptor() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+    FileDescriptor(const FileDescriptor&) = delete;
+    FileDescriptor& operator=(const FileDescriptor&) = delete;
+    FileDescriptor(FileDescriptor&& other) noexcept : fd_(other.fd_) {
+        other.fd_ = -1;
+    }
+    FileDescriptor& operator=(FileDescriptor&& other) noexcept {
+        if (this != &other) {
+            if (fd_ >= 0) close(fd_);
+            fd_ = other.fd_;
+            other.fd_ = -1;
+        }
+        return *this;
+    }
+    int get() const { return fd_; }
+private:
+    int fd_;
+};
+
+// --- Метрики ---
+class Metrics {
+public:
+    std::atomic<uint64_t> cache_hits{0};
+    std::atomic<uint64_t> cache_misses{0};
+    std::atomic<uint64_t> dns_errors{0};
+    std::atomic<uint64_t> send_errors{0};
+};
+
+// --- LRU Cache для DNS-ответов с фоновой очисткой ---
 class LRUCache {
 private:
     struct CacheEntry {
         std::string key;
-        ldns_pkt* pkt;
+        std::shared_ptr<ldns_pkt> pkt;
         std::chrono::steady_clock::time_point timestamp;
     };
     std::unordered_map<std::string, std::list<CacheEntry>::iterator> cache_map;
     std::list<CacheEntry> cache_list;
     size_t capacity;
-    std::mutex mutex;
+    std::shared_mutex mutex;
+    std::thread cleaner_thread;
+    std::atomic<bool> stop_cleaner{false};
+    std::condition_variable_any cleaner_cv;
+
+    void cleanup_expired_entries() {
+        while (!stop_cleaner) {
+            std::unique_lock<std::shared_mutex> lock(mutex);
+            cleaner_cv.wait_for(lock, std::chrono::seconds(CLEANUP_INTERVAL), [this](){ return stop_cleaner.load(); });
+            if (stop_cleaner) break;
+            
+            auto it = cache_list.begin();
+            while (it != cache_list.end()) {
+                if (std::chrono::steady_clock::now() - it->timestamp > std::chrono::seconds(CACHE_TTL)) {
+                    cache_map.erase(it->key);
+                    it = cache_list.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
 
 public:
-    explicit LRUCache(size_t cap) : capacity(cap) {}
+    explicit LRUCache(size_t cap) : capacity(cap) {
+        cleaner_thread = std::thread(&LRUCache::cleanup_expired_entries, this);
+    }
+    ~LRUCache() {
+        stop_cleaner = true;
+        cleaner_cv.notify_one();
+        if (cleaner_thread.joinable()) {
+            cleaner_thread.join();
+        }
+    }
 
-    ldns_pkt* get(const std::string& key) {
-        std::lock_guard<std::mutex> lock(mutex);
+    std::shared_ptr<ldns_pkt> get(const std::string& key) {
+        std::unique_lock<std::shared_mutex> lock(mutex);
         auto it = cache_map.find(key);
         if (it == cache_map.end()) return nullptr;
 
         auto& entry = *(it->second);
         if (std::chrono::steady_clock::now() - entry.timestamp > std::chrono::seconds(CACHE_TTL)) {
-            ldns_pkt_free(entry.pkt);
             cache_map.erase(it);
             cache_list.erase(it->second);
             return nullptr;
         }
         
         cache_list.splice(cache_list.begin(), cache_list, it->second);
+        entry.timestamp = std::chrono::steady_clock::now();
         return entry.pkt;
     }
 
     void put(const std::string& key, ldns_pkt* pkt) {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::unique_lock<std::shared_mutex> lock(mutex);
         auto it = cache_map.find(key);
+        
+        ldns_pkt* new_pkt_clone = ldns_pkt_clone(pkt);
+        if (!new_pkt_clone) {
+            log("Ошибка клонирования DNS-пакета для кеша", "ERROR");
+            return;
+        }
+
         if (it != cache_map.end()) {
-            ldns_pkt_free(it->second->pkt);
+            cache_map.erase(it);
             cache_list.erase(it->second);
         }
 
-        CacheEntry entry{key, pkt, std::chrono::steady_clock::now()};
+        CacheEntry entry{key, std::shared_ptr<ldns_pkt>(new_pkt_clone, ldns_pkt_free), std::chrono::steady_clock::now()};
         cache_list.push_front(entry);
         cache_map[key] = cache_list.begin();
 
         if (cache_list.size() > capacity) {
             auto last_it = cache_list.end();
             --last_it;
-            
             cache_map.erase(last_it->key); 
-            ldns_pkt_free(last_it->pkt);
             cache_list.pop_back();
         }
     }
 };
 
-// Пул потоков
+// --- Пул потоков ---
 class ThreadPool {
 private:
     std::vector<std::thread> workers;
@@ -129,62 +218,64 @@ public:
         }
         condition.notify_all();
         for (auto& worker : workers) {
-            worker.join();
+            if (worker.joinable()) {
+                worker.join();
+            }
         }
     }
 };
 
-// Класс DNS-резолвера
+// --- Класс DNS-резолвера ---
 class DNSResolver {
 private:
-    int sockfd;
-    int epoll_fd;
+    FileDescriptor sockfd;
+    FileDescriptor epoll_fd;
     LRUCache cache;
     ThreadPool pool;
     std::atomic<bool> running{true};
+    Metrics metrics;
     using ldns_pkt_ptr = std::unique_ptr<ldns_pkt, decltype(&ldns_pkt_free)>;
+    using ldns_resolver_ptr = std::unique_ptr<ldns_resolver, decltype(&ldns_resolver_deep_free)>;
     using c_char_ptr = std::unique_ptr<char, decltype(&free)>;
 
 public:
     DNSResolver() : cache(CACHE_SIZE), pool(THREAD_POOL_SIZE) {
-        sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sockfd < 0) {
+        int temp_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (temp_sockfd < 0) {
             throw std::runtime_error("Не удалось создать сокет");
         }
+        sockfd = FileDescriptor(temp_sockfd);
 
         sockaddr_in server_addr{};
         server_addr.sin_family = AF_INET;
         server_addr.sin_addr.s_addr = INADDR_ANY;
         server_addr.sin_port = htons(PORT);
 
-        if (bind(sockfd, (sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-            close(sockfd);
+        if (bind(sockfd.get(), (sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
             throw std::runtime_error("Не удалось привязать сокет");
         }
 
-        epoll_fd = epoll_create1(0);
-        if (epoll_fd < 0) {
-            close(sockfd);
+        int temp_epoll_fd = epoll_create1(0);
+        if (temp_epoll_fd < 0) {
             throw std::runtime_error("Не удалось создать epoll");
         }
+        epoll_fd = FileDescriptor(temp_epoll_fd);
 
         epoll_event ev{};
         ev.events = EPOLLIN;
-        ev.data.fd = sockfd;
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &ev) < 0) {
-            close(sockfd);
-            close(epoll_fd);
+        ev.data.fd = sockfd.get();
+        if (epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, sockfd.get(), &ev) < 0) {
             throw std::runtime_error("Не удалось добавить сокет в epoll");
         }
     }
 
     void handle_query(int client_sock, sockaddr_in client_addr, socklen_t addr_len, const std::vector<uint8_t>& request_data) {
-        thread_local std::unique_ptr<ldns_resolver, decltype(&ldns_resolver_deep_free)> resolver(nullptr, &ldns_resolver_deep_free);
+        thread_local ldns_resolver_ptr resolver(nullptr, &ldns_resolver_deep_free);
         if (!resolver) {
             ldns_resolver* res_ptr = nullptr;
             ldns_status res_status = ldns_resolver_new_frm_file(&res_ptr, nullptr);
             if (res_status != LDNS_STATUS_OK) {
-                std::cerr << "Ошибка в потоке: не удалось создать ldns_resolver: " << ldns_get_errorstr_by_id(res_status) << std::endl;
+                log("Ошибка в потоке: не удалось создать ldns_resolver: " + std::string(ldns_get_errorstr_by_id(res_status)), "ERROR");
                 return;
             }
             ldns_resolver_set_recursive(res_ptr, true);
@@ -194,14 +285,14 @@ public:
         ldns_pkt_ptr query_pkt(nullptr, &ldns_pkt_free);
         ldns_pkt* temp_query_pkt = nullptr;
         if (ldns_wire2pkt(&temp_query_pkt, request_data.data(), request_data.size()) != LDNS_STATUS_OK) {
-            std::cerr << "Ошибка парсинга DNS-запроса" << std::endl;
+            log("Ошибка парсинга DNS-запроса", "ERROR");
             return;
         }
         query_pkt.reset(temp_query_pkt);
 
         ldns_rr_list* question = ldns_pkt_question(query_pkt.get());
         if (!question || ldns_rr_list_rr_count(question) == 0) {
-            std::cerr << "Пустой список вопросов в DNS-запросе" << std::endl;
+            log("Пустой список вопросов в DNS-запросе", "WARN");
             return;
         }
         
@@ -212,18 +303,19 @@ public:
 
         c_char_ptr qname_str_uptr(ldns_rdf2str(name), &free);
         if (!qname_str_uptr) {
-            std::cerr << "Не удалось получить имя запроса" << std::endl;
+            log("Не удалось получить имя запроса", "ERROR");
             return;
         }
         std::string query_key = std::string(qname_str_uptr.get()) + "_" + std::to_string(type);
 
-        if (ldns_pkt* cached_response = cache.get(query_key)) {
-            ldns_pkt_set_id(cached_response, query_id);
-            send_packet(client_sock, client_addr, addr_len, cached_response);
+        if (auto cached_response = cache.get(query_key)) {
+            metrics.cache_hits++;
+            ldns_pkt_set_id(cached_response.get(), query_id);
+            send_packet(client_sock, client_addr, addr_len, cached_response.get());
             return;
         }
 
-        // ⚠️ ИСПРАВЛЕННАЯ СТРОКА: Убрал лишний аргумент '0'
+        metrics.cache_misses++;
         ldns_pkt_ptr response_pkt(nullptr, &ldns_pkt_free);
         ldns_pkt* temp_response_pkt = nullptr;
         ldns_status status = ldns_resolver_send_pkt(&temp_response_pkt, resolver.get(), query_pkt.get());
@@ -231,14 +323,12 @@ public:
         
         if (status == LDNS_STATUS_OK && response_pkt) {
             if (ldns_pkt_answer(response_pkt.get()) && ldns_rr_list_rr_count(ldns_pkt_answer(response_pkt.get())) > 0) {
-                 ldns_pkt* cloned_pkt = ldns_pkt_clone(response_pkt.get());
-                 if (cloned_pkt) {
-                     cache.put(query_key, cloned_pkt);
-                 }
+                 cache.put(query_key, response_pkt.get());
             }
             send_packet(client_sock, client_addr, addr_len, response_pkt.get());
         } else {
-            std::cerr << "Ошибка выполнения DNS-запроса: " << ldns_get_errorstr_by_id(status) << std::endl;
+            metrics.dns_errors++;
+            log("Ошибка выполнения DNS-запроса: " + std::string(ldns_get_errorstr_by_id(status)), "ERROR");
         }
     }
 
@@ -248,43 +338,59 @@ public:
         size_t wire_len = 0;
         if (ldns_pkt2wire(&wire_response, packet, &wire_len) == LDNS_STATUS_OK) {
             wire_buf_ptr wire_response_uptr(wire_response, &free);
-            if (sendto(client_sock, wire_response_uptr.get(), wire_len, 0, (sockaddr*)&client_addr, addr_len) < 0) {
-                std::cerr << "Ошибка отправки ответа: " << strerror(errno) << std::endl;
+            ssize_t bytes_sent = sendto(client_sock, wire_response_uptr.get(), wire_len, 0, (sockaddr*)&client_addr, addr_len);
+            if (bytes_sent < 0) {
+                metrics.send_errors++;
+                log("Ошибка отправки ответа: " + std::string(strerror(errno)), "ERROR");
+            } else if ((size_t)bytes_sent != wire_len) {
+                log("Отправлены не все данные: " + std::to_string(bytes_sent) + " из " + std::to_string(wire_len), "WARN");
             }
         } else {
-            std::cerr << "Ошибка преобразования пакета в wire-формат" << std::endl;
+            log("Ошибка преобразования пакета в wire-формат", "ERROR");
         }
     }
 
     void run() {
         epoll_event events[MAX_EVENTS];
-        uint8_t buffer[MAX_PACKET_SIZE];
+        std::vector<uint8_t> buffer(MAX_PACKET_SIZE);
         
         while (running && !g_stop_signal_received) {
-            int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+            int nfds = epoll_wait(epoll_fd.get(), events, MAX_EVENTS, 1000);
             if (nfds < 0) {
                 if (errno == EINTR) continue;
-                std::cerr << "Ошибка epoll: " << strerror(errno) << std::endl;
+                log("Ошибка epoll: " + std::string(strerror(errno)), "ERROR");
                 continue;
             }
 
             for (int i = 0; i < nfds; ++i) {
-                if (events[i].data.fd == sockfd) {
+                if (events[i].data.fd == sockfd.get()) {
                     sockaddr_in client_addr{};
                     socklen_t addr_len = sizeof(client_addr);
-                    ssize_t len = recvfrom(sockfd, buffer, MAX_PACKET_SIZE, 0, (sockaddr*)&client_addr, &addr_len);
+                    ssize_t len = recvfrom(sockfd.get(), buffer.data(), buffer.size(), 0, (sockaddr*)&client_addr, &addr_len);
                     if (len > 0) {
-                        std::vector<uint8_t> request_data(buffer, buffer + len);
-                        pool.enqueue([this, sock = sockfd, client_addr, addr_len, data = std::move(request_data)]() {
+                         if ((size_t)len > MAX_PACKET_SIZE) {
+                            log("Получен слишком большой пакет (" + std::to_string(len) + " байт), игнорирую.", "WARN");
+                            continue;
+                        }
+                        std::vector<uint8_t> request_data(buffer.begin(), buffer.begin() + len);
+                        pool.enqueue([this, sock = sockfd.get(), client_addr, addr_len, data = std::move(request_data)]() {
                             handle_query(sock, client_addr, addr_len, data);
                         });
                     } else if (len < 0) {
-                        std::cerr << "Ошибка recvfrom: " << strerror(errno) << std::endl;
+                        log("Ошибка recvfrom: " + std::string(strerror(errno)), "ERROR");
                     }
                 }
             }
         }
-        std::cout << "Завершаю работу цикла run()..." << std::endl;
+
+        // Логируем финальные метрики при остановке
+        std::cout << "---" << std::endl;
+        std::cout << "Финальные метрики:" << std::endl;
+        std::cout << "Кеш попаданий: " << metrics.cache_hits << std::endl;
+        std::cout << "Кеш промахов: " << metrics.cache_misses << std::endl;
+        std::cout << "Ошибок DNS-разрешения: " << metrics.dns_errors << std::endl;
+        std::cout << "Ошибок отправки: " << metrics.send_errors << std::endl;
+        std::cout << "---" << std::endl;
     }
 
     void stop() {
@@ -292,14 +398,12 @@ public:
     }
 
     ~DNSResolver() {
-        close(sockfd);
-        close(epoll_fd);
-        std::cout << "Ресурсы DNS-резолвера The ASTRAnet освобождены." << std::endl;
+        // Деструктор сам позаботится об освобождении ресурсов через RAII-обертки
     }
 };
 
+// Async-safe обработчик сигнала
 void signal_handler(int) {
-    std::cout << "\nПолучен сигнал, инициирую остановку..." << std::endl;
     g_stop_signal_received = true;
 }
 
@@ -312,7 +416,7 @@ int main() {
         std::cout << "DNS-резолвер The ASTRAnet запущен на порту " << PORT << std::endl;
         resolver.run();
     } catch (const std::exception& e) {
-        std::cerr << "Критическая ошибка: " << e.what() << std::endl;
+        log("Критическая ошибка: " + std::string(e.what()), "FATAL");
         return 1;
     }
     
