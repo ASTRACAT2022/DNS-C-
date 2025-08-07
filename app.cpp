@@ -36,7 +36,6 @@ static std::atomic<bool> g_stop_signal_received = false;
 static std::mutex log_mutex;
 
 // Простая функция для централизованного логирования
-// Теперь логирует только WARN, ERROR и FATAL
 void log(const std::string& message, const std::string& level = "INFO") {
     if (level == "INFO" || level == "DEBUG") {
         return; // Игнорируем информационные логи
@@ -272,14 +271,42 @@ public:
     void handle_query(int client_sock, sockaddr_in client_addr, socklen_t addr_len, const std::vector<uint8_t>& request_data) {
         thread_local ldns_resolver_ptr resolver(nullptr, &ldns_resolver_deep_free);
         if (!resolver) {
-            ldns_resolver* res_ptr = nullptr;
-            ldns_status res_status = ldns_resolver_new_frm_file(&res_ptr, nullptr);
-            if (res_status != LDNS_STATUS_OK) {
-                log("Ошибка в потоке: не удалось создать ldns_resolver: " + std::string(ldns_get_errorstr_by_id(res_status)), "ERROR");
+            
+            // --- ИСПРАВЛЕННЫЙ БЛОК КОДА ДЛЯ ИСПОЛЬЗОВАНИЯ 1.1.1.1 ---
+            ldns_resolver* res_ptr = ldns_resolver_new();
+            if (!res_ptr) {
+                log("Ошибка в потоке: не удалось создать ldns_resolver.", "ERROR");
                 return;
             }
+
+            ldns_rdf* nameserver_rdf = nullptr;
+            ldns_status status_rdf = ldns_str2rdf_a(&nameserver_rdf, "1.1.1.1");
+            if (status_rdf != LDNS_STATUS_OK || !nameserver_rdf) {
+                log("Ошибка: не удалось преобразовать 1.1.1.1 в RDF", "ERROR");
+                ldns_resolver_deep_free(res_ptr);
+                return;
+            }
+
+            ldns_rr* nameserver_rr = ldns_rr_new();
+            if (!nameserver_rr) {
+                log("Ошибка: не удалось создать RR для nameserver.", "ERROR");
+                ldns_rdf_free(nameserver_rdf);
+                ldns_resolver_deep_free(res_ptr);
+                return;
+            }
+
+            ldns_rr_set_owner(nameserver_rr, ldns_dname_new_frm_str("."));
+            ldns_rr_set_type(nameserver_rr, LDNS_RR_TYPE_A);
+            ldns_rr_set_class(nameserver_rr, LDNS_RR_CLASS_IN);
+            ldns_rr_set_ttl(nameserver_rr, 0);
+            ldns_rr_set_rdf(nameserver_rr, nameserver_rdf, 0);
+
+            ldns_resolver_push_nameserver_rr(res_ptr, nameserver_rr);
+            ldns_rr_free(nameserver_rr);
+            
             ldns_resolver_set_recursive(res_ptr, true);
             resolver.reset(res_ptr);
+            // --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
         }
 
         ldns_pkt_ptr query_pkt(nullptr, &ldns_pkt_free);
@@ -383,7 +410,6 @@ public:
             }
         }
 
-        // Логируем финальные метрики при остановке
         std::cout << "---" << std::endl;
         std::cout << "Финальные метрики:" << std::endl;
         std::cout << "Кеш попаданий: " << metrics.cache_hits << std::endl;
@@ -398,11 +424,9 @@ public:
     }
 
     ~DNSResolver() {
-        // Деструктор сам позаботится об освобождении ресурсов через RAII-обертки
     }
 };
 
-// Async-safe обработчик сигнала
 void signal_handler(int) {
     g_stop_signal_received = true;
 }
