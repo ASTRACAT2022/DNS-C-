@@ -2,6 +2,7 @@
 ```bash
 sudo mkdir -p /etc/ldns/
 sudo wget -O /etc/ldns/root.hints https://www.internic.net/domain/named.root
+sudo chmod 644 /etc/ldns/root.hints
 ```
 -----
 
