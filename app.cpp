@@ -280,16 +280,11 @@ public:
                 return;
             }
             
-            int line_nr = 0; // Добавлена переменная для номера строки
-            ldns_status status = ldns_resolver_new_frm_fp_l(&res_ptr, fp, &line_nr);
+            ldns_status status = ldns_resolver_new_frm_fp_l(&res_ptr, fp);
             fclose(fp);
 
             if (status != LDNS_STATUS_OK) {
-                std::string error_msg = "Ошибка в потоке: не удалось создать рекурсивный ldns_resolver: ";
-                error_msg += ldns_get_errorstr_by_id(status);
-                error_msg += " (строка " + std::to_string(line_nr) + ")";
-                log(error_msg, "ERROR");
-                if (res_ptr) ldns_resolver_deep_free(res_ptr);
+                log("Ошибка в потоке: не удалось создать рекурсивный ldns_resolver: " + std::string(ldns_get_errorstr_by_id(status)), "ERROR");
                 return;
             }
             
@@ -387,7 +382,7 @@ public:
                          if ((size_t)len > MAX_PACKET_SIZE) {
                             log("Получен слишком большой пакет (" + std::to_string(len) + " байт), игнорирую.", "WARN");
                             continue;
-                         }
+                        }
                         std::vector<uint8_t> request_data(buffer.begin(), buffer.begin() + len);
                         pool.enqueue([this, sock = sockfd.get(), client_addr, addr_len, data = std::move(request_data)]() {
                             handle_query(sock, client_addr, addr_len, data);
