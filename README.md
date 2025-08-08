@@ -39,7 +39,7 @@ sudo apt-get install libldns-dev libuv1-dev libxxhash-dev
 Скомпилируйте исходный код в исполняемый файл.
 
 ```bash
-g++ -o dns_resolver app.cpp -I/usr/include -L/usr/lib/x86_64-linux-gnu -lldns -pthread
+g++ -std=c++17 -o dns_resolver app.cpp -I/usr/include -L/usr/lib/x86_64-linux-gnu -lldns -luv -lxxhash -pthread
 ```
 
   * `-o dns_resolver`: Название исполняемого файла.
