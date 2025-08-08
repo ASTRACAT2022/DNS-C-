@@ -24,8 +24,8 @@ git clone https://github.com/ASTRACAT2022/DNS-C-.git
 
 ```bash
 cd DNS-C-
-sudo apt update
-sudo apt install build-essential git libldns-dev -y
+sudo apt-get update
+sudo apt-get install libldns-dev libuv1-dev libxxhash-dev
 ```
 
   * `build-essential`: Содержит компилятор `g++` и другие инструменты для сборки.
