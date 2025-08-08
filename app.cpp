@@ -31,25 +31,39 @@ std::unordered_map<std::string, std::vector<CacheEntry>, XXHash> global_cache;
 std::mutex cache_mutex;
 
 // Конфигурация
-const char* BIND_ADDRESS = "0.0.0.0";
-const int BIND_PORT = 5311; // Изменено для безопасности
+const char* BIND_ADDRESS = "::"; // Используем IPv6-адрес для dual-stack
+const int BIND_PORT = 5311; 
 const size_t UDP_BUFFER_SIZE = 4096;
 
 // Полный список корневых серверов (для ldns_resolver)
 const char* ROOT_SERVERS[] = {
-    "198.41.0.4",      // a.root-servers.net
-    "192.228.79.201",  // b.root-servers.net
-    "192.33.4.12",     // c.root-servers.net
-    "199.7.91.13",     // d.root-servers.net
-    "192.203.230.10",  // e.root-servers.net
-    "192.5.5.241",     // f.root-servers.net
-    "192.112.36.4",    // g.root-servers.net
-    "198.97.190.53",   // h.root-servers.net
-    "192.36.148.17",   // i.root-servers.net
-    "192.58.128.30",   // j.root-servers.net
-    "193.0.14.129",    // k.root-servers.net
-    "199.7.83.42",     // l.root-servers.net
-    "202.12.27.33"     // m.root-servers.net
+    "198.41.0.4",      // a.root-servers.net (IPv4)
+    "192.228.79.201",  // b.root-servers.net (IPv4)
+    "192.33.4.12",     // c.root-servers.net (IPv4)
+    "199.7.91.13",     // d.root-servers.net (IPv4)
+    "192.203.230.10",  // e.root-servers.net (IPv4)
+    "192.5.5.241",     // f.root-servers.net (IPv4)
+    "192.112.36.4",    // g.root-servers.net (IPv4)
+    "198.97.190.53",   // h.root-servers.net (IPv4)
+    "192.36.148.17",   // i.root-servers.net (IPv4)
+    "192.58.128.30",   // j.root-servers.net (IPv4)
+    "193.0.14.129",    // k.root-servers.net (IPv4)
+    "199.7.83.42",     // l.root-servers.net (IPv4)
+    "202.12.27.33",    // m.root-servers.net (IPv4)
+    // Добавляем корневые серверы IPv6, чтобы ldns_resolver мог их использовать
+    "2001:503:ba3e::2:30",  // a.root-servers.net (IPv6)
+    "2001:500:200::b",      // b.root-servers.net (IPv6)
+    "2001:500:2::c",        // c.root-servers.net (IPv6)
+    "2001:500:2d::d",       // d.root-servers.net (IPv6)
+    "2001:500:a8::e",       // e.root-servers.net (IPv6)
+    "2001:500:2f::f",       // f.root-servers.net (IPv6)
+    "2001:500:12::d0d",     // g.root-servers.net (IPv6)
+    "2001:500:1::53",       // h.root-servers.net (IPv6)
+    "2001:7fe::53",         // i.root-servers.net (IPv6)
+    "2001:503:c27::2:30",   // j.root-servers.net (IPv6)
+    "2001:7fd::1",          // k.root-servers.net (IPv6)
+    "2001:500:9f::42",      // l.root-servers.net (IPv6)
+    "2001:500:a1::53"       // m.root-servers.net (IPv6)
 };
 
 // Структура для передачи данных между потоками
@@ -248,10 +262,15 @@ int main() {
     uv_loop_t* main_loop = uv_default_loop();
 
     uv_udp_t server;
-    uv_udp_init(main_loop, &server);
+    // Используем uv_udp_init_ex для указания семейства адресов (AF_INET6)
+    uv_udp_init_ex(main_loop, &server, AF_INET6);
 
-    struct sockaddr_in bind_addr;
-    uv_ip4_addr(BIND_ADDRESS, BIND_PORT, &bind_addr);
+    struct sockaddr_in6 bind_addr;
+    if (uv_ip6_addr(BIND_ADDRESS, BIND_PORT, &bind_addr) != 0) {
+        std::cerr << "Failed to parse IPv6 address" << std::endl;
+        return 1;
+    }
+
     if (uv_udp_bind(&server, (const struct sockaddr*)&bind_addr, UV_UDP_REUSEADDR) != 0) {
         std::cerr << "Failed to bind to port " << BIND_PORT << std::endl;
         return 1;
